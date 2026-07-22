@@ -153,7 +153,14 @@ def maybe_setup_distributed(sp_size: int = 1) -> None:
     if acc is None:
         raise ValueError("No accelerator found")
     backend = torch.distributed.get_default_backend_for_device(acc)
-    dist.init_process_group(backend, device_id=local_rank)
+    # Construct an explicit indexed device (e.g. npu:0 / cuda:0). PyTorch's
+    # init_process_group requires `device_id.index` to be non-None, and on
+    # Ascend NPU the torch_npu `transfer_to_npu` decorator may strip the
+    # index from the accelerator handle, so we rebuild it explicitly from
+    # acc.type + local_rank. On CUDA this is equivalent to passing `acc`
+    # directly since acc.index already equals local_rank.
+    device_id = torch.device(acc.type, local_rank)
+    dist.init_process_group(backend, device_id=device_id)
 
     _rank = dist.get_rank()
     _world_size = dist.get_world_size()
