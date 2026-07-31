@@ -459,7 +459,26 @@ def test_build_from_config_only_reapplies_draft_attn_impl(tmp_path):
             draft_attn_impl="sdpa",
         )
 
+    # auto draft_attn_kernel remaps sdpa → window_sdpa (no dense O(S²) masks)
+    assert built.config.transformer_layer_config._attn_implementation == "window_sdpa"
+    assert built._use_window_attn is True
+
+
+def test_build_from_config_only_dense_kernel_keeps_sdpa(tmp_path):
+    model_dir = _save_config_only_dir(tmp_path)
+
+    with patch.object(Eagle3DraftModel, "load_verifier_weights"):
+        built = _build_from_config_only(
+            Eagle3DraftModel,
+            str(model_dir),
+            None,
+            None,
+            draft_attn_impl="sdpa",
+            draft_attn_kernel="dense",
+        )
+
     assert built.config.transformer_layer_config._attn_implementation == "sdpa"
+    assert built._use_window_attn is False
 
 
 # ---------------------------------------------------------------------------

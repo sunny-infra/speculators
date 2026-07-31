@@ -86,6 +86,16 @@ class Eagle3SpeculatorConfig(SpeculatorModelConfig):
         description="Whether embedding layer weights require gradients during training",
     )
 
+    draft_attn_kernel: Literal["auto", "window_sdpa", "dense"] = Field(
+        default="auto",
+        description=(
+            "Attention kernel for sdpa/eager backends. 'auto' and 'window_sdpa' use "
+            "document+sliding-window attention without materializing dense O(S²) "
+            "masks (and windowed TTT KV). 'dense' keeps the legacy full-mask path. "
+            "Ignored when draft_attn_impl is simple_flex_attention."
+        ),
+    )
+
     @model_validator(mode="after")
     def _check_norm_flags(self) -> "Eagle3SpeculatorConfig":
         if self.norm_before_fc and self.fc_norm:

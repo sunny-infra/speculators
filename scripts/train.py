@@ -372,6 +372,7 @@ def _build_from_config_only(
     d2t: torch.Tensor | None,
     verifier_name_or_path: str | None = None,
     draft_attn_impl: str | None = None,
+    draft_attn_kernel: str | None = None,
 ) -> SpeculatorModel:
     """Initialize a fresh draft from a saved speculator *config* (no weights).
 
@@ -382,6 +383,8 @@ def _build_from_config_only(
     config = model_class.config_class.from_pretrained(path)
     if draft_attn_impl is not None:
         config.transformer_layer_config._attn_implementation = draft_attn_impl
+    if draft_attn_kernel is not None and hasattr(config, "draft_attn_kernel"):
+        config.draft_attn_kernel = draft_attn_kernel
     speculators_config = getattr(config, "speculators_config", None)
     # Fall back to the CLI --verifier-name-or-path only when the saved config has
     # no verifier path -- either null or blanked to "". A real path in the config
@@ -437,6 +440,11 @@ def build_draft_model(
                 draft_attn_impl=(
                     args.draft_attn_impl if args.speculator_type != "mtp" else None
                 ),
+                draft_attn_kernel=(
+                    getattr(args, "draft_attn_kernel", None)
+                    if args.speculator_type != "mtp"
+                    else None
+                ),
             )
         if args.speculator_type != "mtp":
             # _attn_implementation is never serialized by HF configs, so re-apply
@@ -445,6 +453,8 @@ def build_draft_model(
             # __init__ resolves its own default ("eager") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
+            if hasattr(config, "draft_attn_kernel"):
+                config.draft_attn_kernel = getattr(args, "draft_attn_kernel", "auto")
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,

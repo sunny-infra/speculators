@@ -16,6 +16,11 @@ from speculators.models.eagle3.attention import (
 )
 from speculators.models.eagle3.metrics import compute_metrics
 from speculators.models.eagle3.model_definitions import model_classes
+from speculators.models.eagle3.window_attention import (
+    Eagle3WindowedCache,
+    resolve_window_attn_implementation,
+    uses_window_attn_kernel,
+)
 from speculators.models.metrics import LossConfig, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
@@ -46,12 +51,20 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
                 "simple_flex_attention"
             )
-        self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
+        # Remap sdpa/eager → window_* when draft_attn_kernel is auto/window_sdpa
+        draft_attn_kernel = getattr(config, "draft_attn_kernel", "auto")
+        resolved_impl = resolve_window_attn_implementation(
+            config.transformer_layer_config._attn_implementation,  # noqa: SLF001
+            draft_attn_kernel,
+        )
+        config.transformer_layer_config._attn_implementation = resolved_impl  # noqa: SLF001
+        self._attn_impl = resolved_impl
+        self._use_window_attn = uses_window_attn_kernel(self._attn_impl)
         self._create_mask_fn = (
             create_block_mask
             if self._attn_impl == "simple_flex_attention"
             else create_float_mask
-            if self._attn_impl == "eager"
+            if self._attn_impl in ("eager", "window_eager")
             else create_mask
         )
         super().__init__(config=config)
@@ -208,25 +221,31 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             ).unsqueeze(0)
             # shape: [1, total_seq_len]
 
-        past_key_values = DynamicCache()
-
         doc_ids_1d = document_ids.squeeze(0).to(device)
 
-        full_attn_mask = (
-            self._build_attn_mask(doc_ids_1d, total_seq_len, device)
-            if self.uses_full_attn
-            else None
-        )
-        sliding_window_attn_mask = (
-            self._build_attn_mask(
-                doc_ids_1d,
-                total_seq_len,
-                device,
-                self.sliding_window,
+        if self._use_window_attn:
+            # No dense O(S²) masks; window kernel + Eagle3WindowedCache handle
+            # document/SWA/TTT diagonals with local O(S·W) attention.
+            past_key_values: DynamicCache | Eagle3WindowedCache = Eagle3WindowedCache()
+            full_attn_mask = None
+            sliding_window_attn_mask = None
+        else:
+            past_key_values = DynamicCache()
+            full_attn_mask = (
+                self._build_attn_mask(doc_ids_1d, total_seq_len, device)
+                if self.uses_full_attn
+                else None
             )
-            if self.uses_sliding_window_attn
-            else None
-        )
+            sliding_window_attn_mask = (
+                self._build_attn_mask(
+                    doc_ids_1d,
+                    total_seq_len,
+                    device,
+                    self.sliding_window,
+                )
+                if self.uses_sliding_window_attn
+                else None
+            )
 
         if self.input_norm is not None:
             hidden_states = self.input_norm(hidden_states)
@@ -279,20 +298,40 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
             for layer_idx, decoder_layer in enumerate(self.layers):
-                layer_mask = (
-                    sliding_window_attn_mask
-                    if layer_idx in self.sliding_window_indices
-                    else full_attn_mask
-                )
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=layer_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
+                if self._use_window_attn:
+                    layer_window = (
+                        self.sliding_window
+                        if layer_idx in self.sliding_window_indices
+                        else None
+                    )
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=None,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        eagle3_ttt_cache=past_key_values,
+                        eagle3_document_ids=doc_ids_1d,
+                        eagle3_sliding_window=layer_window,
+                        eagle3_total_seq_len=total_seq_len,
+                        **kwargs,
+                    )
+                else:
+                    layer_mask = (
+                        sliding_window_attn_mask
+                        if layer_idx in self.sliding_window_indices
+                        else full_attn_mask
+                    )
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=layer_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
 
             if self.config.norm_output:
                 hidden_states = self.norm(hidden_states)
@@ -333,22 +372,25 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             )
             # shape: [1, total_seq_len]
 
-            if self._attn_impl == "simple_flex_attention":
-                if full_attn_mask is not None:
-                    full_attn_mask = extend_mask_for_draft_tokens(full_attn_mask)
-                if sliding_window_attn_mask is not None:
-                    sliding_window_attn_mask = extend_mask_for_draft_tokens(
-                        sliding_window_attn_mask
-                    )
-            else:
-                if full_attn_mask is not None:
-                    full_attn_mask = extend_dense_mask_for_draft_tokens(
-                        full_attn_mask, total_seq_len
-                    )
-                if sliding_window_attn_mask is not None:
-                    sliding_window_attn_mask = extend_dense_mask_for_draft_tokens(
-                        sliding_window_attn_mask, total_seq_len
-                    )
+            if not self._use_window_attn:
+                # Window kernel reads TTT diagonals from Eagle3WindowedCache;
+                # no mask extension needed.
+                if self._attn_impl == "simple_flex_attention":
+                    if full_attn_mask is not None:
+                        full_attn_mask = extend_mask_for_draft_tokens(full_attn_mask)
+                    if sliding_window_attn_mask is not None:
+                        sliding_window_attn_mask = extend_mask_for_draft_tokens(
+                            sliding_window_attn_mask
+                        )
+                else:
+                    if full_attn_mask is not None:
+                        full_attn_mask = extend_dense_mask_for_draft_tokens(
+                            full_attn_mask, total_seq_len
+                        )
+                    if sliding_window_attn_mask is not None:
+                        sliding_window_attn_mask = extend_dense_mask_for_draft_tokens(
+                            sliding_window_attn_mask, total_seq_len
+                        )
             position_ids = position_ids + 1
             # shape: [1, total_seq_len]
 
@@ -399,6 +441,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             fc_norm=kwargs.get("fc_norm", False),
             norm_output=kwargs.get("norm_output", False),
             embed_requires_grad=kwargs.get("embed_requires_grad", False),
+            draft_attn_kernel=kwargs.get("draft_attn_kernel", "auto"),
             eagle_aux_hidden_state_layer_ids=target_layer_ids,
             speculators_config=SpeculatorsConfig(
                 algorithm="eagle3",

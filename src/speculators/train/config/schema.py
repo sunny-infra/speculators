@@ -190,6 +190,15 @@ class DraftArgs(_Group):
         description="Attention implementation for draft layers. Use 'sdpa' or 'eager' "
         "for hardware that doesn't support flex attention. Not supported for MTP.",
     )
+    draft_attn_kernel: Literal["auto", "window_sdpa", "dense"] = Field(
+        default="auto",
+        description=(
+            "Kernel used when --draft-attn-impl is sdpa/eager. 'auto'/'window_sdpa' "
+            "avoid dense O(S²) masks via document+SWA chunked attention and windowed "
+            "TTT KV (recommended for NPU long-seq). 'dense' uses the legacy full mask. "
+            "Ignored for simple_flex_attention."
+        ),
+    )
 
 
 class DataArgs(_Group):

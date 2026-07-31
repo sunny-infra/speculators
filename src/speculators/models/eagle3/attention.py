@@ -6,6 +6,11 @@ from torch.nn.attention.flex_attention import (
 )
 
 from speculators.models.attention import ALL_ATTENTION_FUNCTIONS  # noqa: F401
+from speculators.models.eagle3.window_attention import (  # noqa: F401
+    Eagle3WindowedCache,
+    resolve_window_attn_implementation,
+    uses_window_attn_kernel,
+)
 
 
 def create_combined_mask_mod(
