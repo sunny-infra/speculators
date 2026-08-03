@@ -18,15 +18,36 @@ from speculators.train.data import (
     create_collate_fn,
     split_files,
 )
-from speculators.train.distributed import get_dp_rank, get_dp_size
+from speculators.train.distributed import get_dp_rank, get_dp_size, get_sp_rank, get_sp_size
 from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
 )
 from speculators.train.noise_transforms import AddUniformNoise
+from speculators.train.sequence_parallel import pad_seq_to_sp_multiple, shard_batch_for_sp
 
 logger = logging.getLogger(__name__)
 
 BatchType = dict[str, Any]
+
+
+def _wrap_collate_for_sp(collate_fn: Callable):
+    """Pad to sp multiple and slice the packed batch for this SP rank.
+
+    All ranks in a DP group share the same multipack indices (same dp_rank),
+    each loads the full packed sequence, then keeps only its shard. This is
+    simple/correct for online training; slice-only I/O can come later.
+    """
+    sp_size = get_sp_size()
+    sp_rank = get_sp_rank()
+
+    def _collate(batch: list) -> BatchType:
+        collated = collate_fn(batch)
+        if sp_size <= 1:
+            return collated
+        collated = pad_seq_to_sp_multiple(collated, sp_size)
+        return shard_batch_for_sp(collated, sp_rank, sp_size)
+
+    return _collate
 
 
 def _setup_dataloader(
@@ -38,6 +59,8 @@ def _setup_dataloader(
     prefetch_factor: int | None = 4,
     preprocess: Callable[[BatchType], BatchType] | None = None,
 ) -> DataLoader:
+    # Multipack across DP replicas only; SP ranks within a DP group see the
+    # same sample indices and shard the packed sequence after collation.
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=total_seq_len,
         lengths=dataset.approx_lengths,
@@ -45,19 +68,20 @@ def _setup_dataloader(
         rank=get_dp_rank(),
     )
     use_workers = num_workers > 0
+    collate_fn = create_collate_fn(
+        total_seq_len,
+        hidden_size,
+        num_target_layers=num_target_layers,
+        dtype=dataset.hidden_states_dtype,
+        preprocess=preprocess,
+    )
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if use_workers else None,
         pin_memory=True,
-        collate_fn=create_collate_fn(
-            total_seq_len,
-            hidden_size,
-            num_target_layers=num_target_layers,
-            dtype=dataset.hidden_states_dtype,
-            preprocess=preprocess,
-        ),
+        collate_fn=_wrap_collate_for_sp(collate_fn),
         persistent_workers=use_workers,
     )
 

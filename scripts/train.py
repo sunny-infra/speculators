@@ -31,6 +31,7 @@ from speculators.train.distributed import (
     maybe_destroy_distributed,
     maybe_setup_distributed,
 )
+from speculators.train.sequence_parallel import validate_sp_head_divisibility
 from speculators.train.logger import setup_metric_logger, setup_root_logger
 from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.train.utils import resolve_mask_token_id
@@ -533,13 +534,28 @@ def main(cfg: TrainConfig):  # noqa: C901
         loggers=args.logger, run_name=args.run_name, output_dir=args.log_dir
     )
 
-    # Setup distributed training
-    maybe_setup_distributed()
+    # Setup distributed training (DP × SP topology when --sp-size > 1)
+    maybe_setup_distributed(sp_size=args.sp_size)
 
     if args.fsdp_shard and not is_distributed():
         raise ValueError(
             "--fsdp-shard requires launching with torchrun/distributed training; "
             "otherwise parameters are not sharded."
+        )
+    if args.sp_size > 1 and args.fsdp_shard:
+        raise ValueError(
+            "--sp-size > 1 is incompatible with --fsdp-shard in this release; "
+            "use DDP (default) so parameters stay replicated within each SP group."
+        )
+    if args.sp_size > 1 and args.draft_attn_impl == "simple_flex_attention":
+        raise ValueError(
+            "--sp-size > 1 requires --draft-attn-impl sdpa (or eager) with the "
+            "window kernel; flex attention is not supported under Ulysses SP."
+        )
+    if args.sp_size > 1 and getattr(args, "draft_attn_kernel", "auto") == "dense":
+        raise ValueError(
+            "--sp-size > 1 requires draft_attn_kernel=auto|window_sdpa "
+            "(dense O(S²) masks are not supported under Ulysses SP)."
         )
 
     # Install partial-neox rotary patch if not using full-head hack
@@ -589,6 +605,14 @@ def main(cfg: TrainConfig):  # noqa: C901
     model_class = registry[args.speculator_type]
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
+
+    if args.sp_size > 1:
+        tl = draft_model.config.transformer_layer_config
+        validate_sp_head_divisibility(
+            num_attention_heads=tl.num_attention_heads,
+            num_key_value_heads=tl.num_key_value_heads,
+            sp_size=args.sp_size,
+        )
 
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]

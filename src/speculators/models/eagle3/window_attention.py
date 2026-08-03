@@ -290,7 +290,12 @@ def _window_attention_forward(
     eagle3_chunk_size: int | None = None,
     **_kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
-    """AttentionInterface entrypoint for window_sdpa / window_eager."""
+    """AttentionInterface entrypoint for window_sdpa / window_eager.
+
+    When sequence parallel (Ulysses) is enabled, Q/K/V are all-to-all'd from
+    seq-sharded ``[B, H, S/N, D]`` to head-sharded ``[B, H/N, S, D]`` before
+    the local window kernel, then gathered back.
+    """
     if eagle3_document_ids is None:
         raise ValueError(
             "window_sdpa/window_eager require eagle3_document_ids kwarg "
@@ -308,8 +313,8 @@ def _window_attention_forward(
     ):
         base_k = eagle3_ttt_cache.base_keys[layer_idx]
         base_v = eagle3_ttt_cache.base_values[layer_idx]
-        draft_ks = eagle3_ttt_cache.draft_keys[layer_idx]
-        draft_vs = eagle3_ttt_cache.draft_values[layer_idx]
+        draft_ks = list(eagle3_ttt_cache.draft_keys[layer_idx])
+        draft_vs = list(eagle3_ttt_cache.draft_values[layer_idx])
     else:
         # Fallback: key/value already concatenated as [base | d1 | d2 | ...]
         total_seq_len = eagle3_total_seq_len or query.shape[-2]
@@ -330,6 +335,27 @@ def _window_attention_forward(
     if doc_ids.ndim > 1:
         doc_ids = doc_ids.reshape(-1)
 
+    # Ulysses: seq-parallel → head-parallel, then reverse after attention.
+    # Lazy import avoids circular deps at module load.
+    from speculators.train.sequence_parallel.ulysses import (  # noqa: PLC0415
+        gather_document_ids,
+        seq_all_to_all,
+        ulysses_enabled,
+    )
+
+    if ulysses_enabled():
+        # [B, H, S/N, D] → [B, H/N, S, D]
+        query = seq_all_to_all(query, scatter_idx=1, gather_idx=2)
+        base_k = seq_all_to_all(base_k, scatter_idx=1, gather_idx=2)
+        base_v = seq_all_to_all(base_v, scatter_idx=1, gather_idx=2)
+        draft_ks = [seq_all_to_all(k, scatter_idx=1, gather_idx=2) for k in draft_ks]
+        draft_vs = [seq_all_to_all(v, scatter_idx=1, gather_idx=2) for v in draft_vs]
+        doc_ids = gather_document_ids(doc_ids)
+        # Heads already sharded; GQA groups must be recomputed for local heads.
+        # After Ulysses, Q heads and KV heads are both divided by sp_size, so
+        # the group ratio is unchanged.
+        n_groups = getattr(module, "num_key_value_groups", 1)
+
     attn_out = windowed_document_attention(
         query,
         base_k,
@@ -345,7 +371,13 @@ def _window_attention_forward(
         chunk_size=eagle3_chunk_size,
         num_key_value_groups=n_groups,
     )
-    # Match HF attention interface: [B, S, H, D]
+    # attn_out: [B, H', S', D] (H'=H/N, S'=S when Ulysses; else H'=H, S'=S/N)
+
+    if ulysses_enabled():
+        # [B, H/N, S, D] → [B, H, S/N, D]
+        attn_out = seq_all_to_all(attn_out, scatter_idx=2, gather_idx=1)
+
+    # Match HF attention interface: [B, S_local, H, D]
     return attn_out.transpose(1, 2).contiguous(), None
 
 

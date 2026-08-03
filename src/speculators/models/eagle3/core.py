@@ -14,7 +14,7 @@ from speculators.models.eagle3.attention import (
     extend_dense_mask_for_draft_tokens,
     extend_mask_for_draft_tokens,
 )
-from speculators.models.eagle3.metrics import compute_metrics
+from speculators.models.eagle3.metrics import compute_metrics, compute_metrics_chunked
 from speculators.models.eagle3.model_definitions import model_classes
 from speculators.models.eagle3.window_attention import (
     Eagle3WindowedCache,
@@ -210,10 +210,16 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         ttt_steps: int = 3,
         ttt_step_loss_decay: float = 1.0,
         loss_config: LossConfig | None = None,
+        logits_chunk_size: int = 0,
         **kwargs,
     ):
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
+        # Pop non-layer kwargs stashed by the dataloader / SP shard helper so
+        # they are not forwarded into HF decoder layers.
+        kwargs.pop("sp_global_seq_len", None)
+        kwargs.pop("sp_global_start", None)
+        kwargs.pop("lengths", None)
 
         if position_ids is None:
             position_ids = 1 + torch.arange(
@@ -260,12 +266,26 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
 
         original_input_ids = input_ids.detach().clone()
         return_loss = verifier_last_hidden_states is not None
+        use_chunked_loss = return_loss and logits_chunk_size > 0
+        targets = None
         if return_loss:
-            with torch.no_grad():
-                targets = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states)
-                )
-                # shape: [1, total_seq_len, draft_vocab_size]
+            if use_chunked_loss:
+                # Defer teacher logits: materialize per chunk inside
+                # compute_metrics_chunked to bound peak S×V memory.
+                assert verifier_last_hidden_states is not None
+                _vlhs = verifier_last_hidden_states
+
+                def _target_fn(start: int, end: int) -> torch.Tensor:
+                    with torch.no_grad():
+                        return self.verifier_lm_head(
+                            self.verifier_norm(_vlhs[:, start:end])
+                        )
+            else:
+                with torch.no_grad():
+                    targets = self.verifier_lm_head(
+                        self.verifier_norm(verifier_last_hidden_states)
+                    )
+                    # shape: [1, total_seq_len, draft_vocab_size]
             loss = torch.tensor(0.0, device=device)
 
             # prev_correct is a boolean tensor that is True for tokens that have been
@@ -333,27 +353,52 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                         **kwargs,
                     )
 
-            if self.config.norm_output:
-                hidden_states = self.norm(hidden_states)
-                logits = self.lm_head(hidden_states)
-            else:
-                logits = self.lm_head(self.norm(hidden_states))
-            # shape: [1, total_seq_len, draft_vocab_size]
-
-            if return_loss:
-                s_loss, s_metrics = compute_metrics(
-                    logits,
-                    targets,
+            if use_chunked_loss:
+                if self.config.norm_output:
+                    # Feed post-norm hidden states into the next TTT step.
+                    hidden_states = self.norm(hidden_states)
+                    hs_for_loss = hidden_states
+                else:
+                    hs_for_loss = hidden_states
+                s_loss, s_metrics, input_ids = compute_metrics_chunked(
+                    hs_for_loss,
+                    self.norm,
+                    self.lm_head,
+                    _target_fn,
                     loss_mask,
                     prev_correct,
                     ttt_step,
                     ttt_step_loss_decay,
                     loss_config=loss_config,
+                    chunk_size=logits_chunk_size,
+                    norm_output=self.config.norm_output,
                 )
                 loss += s_loss
                 metrics.update(s_metrics)
+            else:
+                if self.config.norm_output:
+                    hidden_states = self.norm(hidden_states)
+                    logits = self.lm_head(hidden_states)
+                else:
+                    logits = self.lm_head(self.norm(hidden_states))
+                # shape: [1, total_seq_len, draft_vocab_size]
 
-            input_ids = torch.argmax(logits, dim=-1)
+                if return_loss:
+                    assert targets is not None
+                    s_loss, s_metrics = compute_metrics(
+                        logits,
+                        targets,
+                        loss_mask,
+                        prev_correct,
+                        ttt_step,
+                        ttt_step_loss_decay,
+                        loss_config=loss_config,
+                    )
+                    loss += s_loss
+                    metrics.update(s_metrics)
+
+                input_ids = torch.argmax(logits, dim=-1)
+
             draft_tokens.append(input_ids.detach().clone())
             # shape: [1, total_seq_len]
 
@@ -472,14 +517,17 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             Tuple of (train_call_kwargs, val_call_kwargs)
         """
         loss_config = resolve_loss_config(kwargs["loss_fn"])
+        logits_chunk_size = int(kwargs.get("logits_chunk_size") or 0)
         train_kwargs = {
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
             "loss_config": loss_config,
+            "logits_chunk_size": logits_chunk_size,
         }
         val_kwargs = {
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
             "loss_config": loss_config,
+            "logits_chunk_size": logits_chunk_size,
         }
         return train_kwargs, val_kwargs

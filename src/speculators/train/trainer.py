@@ -28,8 +28,11 @@ from speculators.train.checkpointer import (
 )
 from speculators.train.distributed import (
     apply_fully_sharded,
+    get_dp_group,
     get_local_rank,
     get_rank,
+    get_sp_group,
+    get_sp_size,
     is_distributed,
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
@@ -332,8 +335,15 @@ class Trainer:
                 dist.broadcast(param.data, src=0)
             dist.barrier()
 
-        # DDP constructor broadcasts rank 0's params to all ranks
-        self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
+        # DDP over the DP group only when SP is enabled, so parameters stay
+        # replicated within each SP group and grads are averaged across data
+        # replicas. SP grads are all-reduced separately after backward.
+        ddp_kwargs = {}
+        if get_sp_size() > 1:
+            ddp_kwargs["process_group"] = get_dp_group()
+        self.model = DistributedDataParallel(  # type: ignore[assignment]
+            self.model, **ddp_kwargs
+        )
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -378,6 +388,18 @@ class Trainer:
     def _optimizers_zero_grad(self):
         for opt in self.optimizers:
             opt.zero_grad()
+
+    def _allreduce_sp_grads(self) -> None:
+        """Average gradients across the SP group (token-sharded loss → full-seq grad)."""
+        sp_size = get_sp_size()
+        sp_group = get_sp_group()
+        if sp_size <= 1 or sp_group is None:
+            return
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=sp_group)
+            param.grad.div_(sp_size)
 
     def _optimizers_step(self):
         for opt in self.optimizers:
@@ -467,6 +489,7 @@ class Trainer:
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
+            self._allreduce_sp_grads()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             timer.mark("bwd")

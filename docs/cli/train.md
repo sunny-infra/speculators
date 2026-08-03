@@ -88,6 +88,8 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--total-seq-len`** (int, default: `8192`) Maximum total sequence length for training batches. Note: samples will be packed into batches with total combined sequence length `{total-seq-len}`.
 
+- **`--logits-chunk-size`** (int, default: `0`) When > 0, compute teacher/draft logits and loss in chunks of this many positions to avoid materializing full `S×V` tensors. Recommended for 32k/64k (e.g. `512` or `1024`). `0` disables chunking.
+
 ### Vocabulary Mapping Arguments
 
 - **`--draft-vocab-size`** (int, default: `None`) Vocabulary size for the draft model. If not specified and no vocab mapping files are provided, uses full verifier vocabulary.
@@ -105,6 +107,8 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 ### Distributed Training Arguments
 
 - **`--fsdp-shard`** (flag) Shard model parameters across GPUs with FSDP. By default, parameters are fully replicated (DDP-like). Enable this when the model does not fit in a single GPU's memory.
+
+- **`--sp-size`** (int, default: `1`) Sequence-parallel (Ulysses) degree. `WORLD_SIZE` must be divisible by `sp_size`; topology is `DP × SP`. Each SP group shards one packed sequence along the length dimension and all-to-alls attention heads. Requires `--draft-attn-impl sdpa` (window kernel) and attention/KV head counts divisible by `sp_size`. Incompatible with `--fsdp-shard` in this release.
 
 ### Training Arguments
 
@@ -165,6 +169,8 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 ### Attention Backend Arguments
 
 - **`--draft-attn-impl`** (str, default: `"simple_flex_attention"`) Attention implementation for draft layers. Options: `simple_flex_attention`, `sdpa`, `eager`. Use `sdpa` or `eager` on hardware where flex attention is unavailable (e.g. Ascend NPU). Applies to Eagle3, P-EAGLE, and DFlash. Not supported for MTP.
+
+- **`--draft-attn-kernel`** (str, default: `"auto"`) Kernel used when `--draft-attn-impl` is `sdpa`/`eager`. `auto`/`window_sdpa` avoid dense O(S²) masks via document+SWA chunked attention and windowed TTT KV (required for NPU long-seq and for `--sp-size > 1`). `dense` keeps the legacy full-mask path. Ignored for `simple_flex_attention`.
 
 ### DFlash-Specific Arguments
 

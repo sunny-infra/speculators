@@ -222,6 +222,15 @@ class DataArgs(_Group):
     total_seq_len: int = Field(
         default=8192, description="Maximum training sequence length, in tokens."
     )
+    logits_chunk_size: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "When > 0, compute teacher/draft logits and loss in chunks of this many "
+            "positions to avoid materializing full S×V tensors (recommended for "
+            "32k/64k). 0 disables chunking."
+        ),
+    )
     train_data_ratio: float = Field(
         default=0.9,
         description="Fraction of the dataset used for training; the remainder is held "
@@ -409,6 +418,18 @@ class TrainerArgs(_Group):
         description="Shard model parameters across GPUs with FSDP. By default "
         "parameters are fully replicated (DDP-like). Enable when the model does not "
         "fit in a single GPU's memory.",
+    )
+    sp_size: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Sequence-parallel (Ulysses) degree. world_size must be divisible by "
+            "sp_size; topology is DP × SP. Each SP group shards one packed sequence "
+            "along the length dim and all-to-alls attention heads. Requires "
+            "--draft-attn-impl sdpa (window kernel) and head counts divisible by "
+            "sp_size. Incompatible with --fsdp-shard in this release "
+            "(use DDP replication within SP)."
+        ),
     )
     max_steps: int | None = Field(
         default=None,

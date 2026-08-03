@@ -14,6 +14,12 @@ Learn how to train an Eagle-3 speculator using online training, where hidden sta
 
 **Time required:** ~30 mins
 
+## [Train Eagle-3 Online at 32k / 64k (NPU / SDPA)](train_eagle3_online_long_seq.md)
+
+Long-context online Eagle-3 with window SDPA, chunked logits, and Ulysses sequence parallel (`--sp-size`) for Ascend NPU (no flex attention).
+
+**Time required:** depends on cluster size; start with the 32k SP=4 smoke recipe
+
 ## [Train Eagle-3 Model Offline](train_eagle3_offline.md)
 
 Learn how to train an Eagle-3 speculator using offline training with pre-generated hidden states.

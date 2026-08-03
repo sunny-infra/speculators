@@ -22,6 +22,14 @@ During data preparation, Speculators automatically detects assistant response bo
 
 Both [Eagle-3](algorithms/eagle3.md) and [DFlash](algorithms/dflash.md) models use PyTorch's `flex_attention` with `BlockMask` for efficient, structured attention patterns (causal, document-aware, and anchor-based). The Eagle-3 forward pass is wrapped with `torch.compile` for additional runtime optimization.
 
+## Window SDPA for Long Sequences (NPU)
+
+When flex attention is unavailable (`--draft-attn-impl sdpa|eager`), Eagle-3 can use a document + sliding-window attention kernel (`--draft-attn-kernel auto|window_sdpa`) that never materializes dense `O(S²)` masks. TTT uses a windowed KV cache instead of concatenating `ttt_steps × S` keys. Pair with `--logits-chunk-size` to bound `S×V` logits memory.
+
+## Ulysses Sequence Parallel
+
+`--sp-size N` enables Ulysses SP (`DP × SP` topology): each SP group shards one packed sequence along the length dimension and all-to-alls attention heads before the window SDPA kernel. Use this for true 32k/64k online training on multi-NPU nodes. See [Train Eagle-3 Online at 32k/64k](tutorials/train_eagle3_online_long_seq.md).
+
 ## Efficient Sequence Packing
 
 The multipack batch sampler uses an LPT (Longest Processing Time First) bin-packing algorithm to pack variable-length sequences into batches, maximizing GPU utilization while respecting per-device token limits. This avoids the wasted compute from naive padding.
