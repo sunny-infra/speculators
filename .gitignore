@@ -174,3 +174,20 @@ cython_debug/
 
 # Visual Studio Code
 .vscode/
+
+# === Local environment-specific scripts (paths/weights/hardware) ===
+launch_qwne3_8b.sh
+prepare_qwen38b_data.sh
+train_qwen3_8b.sh
+train_qwen3_8b_usp.sh
+
+# === Local data, caches, and outputs ===
+hiddenstate-8b/
+qwen3-8b-3k/
+output/
+
+# === Temporary files ===
+*.tmp
+*.bak
+*.swp
+*~

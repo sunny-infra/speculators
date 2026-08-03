@@ -25,6 +25,39 @@ from speculators.models.metrics import LossConfig, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
+_EPS = 1e-5
+
+
+def _sp_scale_loss(s_loss: torch.Tensor, s_denom: torch.Tensor) -> torch.Tensor:
+    """Scale per-rank loss so SP gradient SUM equals the global-loss gradient.
+
+    Each rank computes ``s_loss = S_local / (D_local + _EPS)`` where ``S_local``
+    is the local elementwise-loss sum and ``D_local`` the local masked-token
+    count.  The global loss is ``S_global / (D_global + _EPS)`` with
+    ``S_global = Σ_r S_r`` and ``D_global = Σ_r D_r``.
+
+    Scaling ``s_loss`` by ``(D_local + _EPS) / (D_global + _EPS)`` yields
+    ``S_local / (D_global + _EPS)``; summing gradients across SP ranks then
+    gives the exact global-loss gradient (trainer uses SUM, not AVG).
+
+    When SP is disabled this is a no-op returning ``s_loss`` unchanged.
+    """
+    try:
+        from speculators.train.sequence_parallel.ulysses import ulysses_enabled
+    except ImportError:
+        return s_loss
+    if not ulysses_enabled():
+        return s_loss
+
+    import torch.distributed as dist
+
+    from speculators.train.distributed import get_sp_group
+
+    s_denom_global = s_denom.detach().clone()
+    dist.all_reduce(s_denom_global, op=dist.ReduceOp.SUM, group=get_sp_group())
+    scale = (s_denom + _EPS) / (s_denom_global + _EPS)
+    return s_loss * scale
+
 
 @SpeculatorModel.register("eagle3")
 class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
@@ -360,7 +393,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     hs_for_loss = hidden_states
                 else:
                     hs_for_loss = hidden_states
-                s_loss, s_metrics, input_ids = compute_metrics_chunked(
+                s_loss, s_metrics, input_ids, s_denom = compute_metrics_chunked(
                     hs_for_loss,
                     self.norm,
                     self.lm_head,
@@ -373,7 +406,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     chunk_size=logits_chunk_size,
                     norm_output=self.config.norm_output,
                 )
-                loss += s_loss
+                loss += _sp_scale_loss(s_loss, s_denom)
                 metrics.update(s_metrics)
             else:
                 if self.config.norm_output:
@@ -385,7 +418,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
 
                 if return_loss:
                     assert targets is not None
-                    s_loss, s_metrics = compute_metrics(
+                    s_loss, s_metrics, s_denom = compute_metrics(
                         logits,
                         targets,
                         loss_mask,
@@ -394,7 +427,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                         ttt_step_loss_decay,
                         loss_config=loss_config,
                     )
-                    loss += s_loss
+                    loss += _sp_scale_loss(s_loss, s_denom)
                     metrics.update(s_metrics)
 
                 input_ids = torch.argmax(logits, dim=-1)

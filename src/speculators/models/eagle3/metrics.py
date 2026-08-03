@@ -4,6 +4,7 @@ from collections.abc import Callable
 from functools import partial
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from speculators.models.metrics import (
     LossConfig,
@@ -58,7 +59,7 @@ def compute_metrics(
     ttt_step: int,
     ttt_step_loss_decay: float,
     loss_config: LossConfig | None = None,
-) -> tuple[torch.Tensor, dict]:
+) -> tuple[torch.Tensor, dict, torch.Tensor]:
     """Compute metrics for a given ttt_step.
 
     Args:
@@ -74,7 +75,9 @@ def compute_metrics(
         Modifies prev_correct in place.
 
     Returns:
-        Loss value and metrics dictionary.
+        ``(loss, metrics, loss_denom)`` where ``loss_denom`` is the scalar count
+        of masked positions used to normalize ``s_loss`` (needed for correct SP
+        gradient scaling).
     """
     if loss_config is None:
         loss_config = {"kl_div": (kl_div_loss, 1.0)}
@@ -98,6 +101,9 @@ def compute_metrics(
         loss_config=loss_config,
         decay_fn=partial(exp_loss_decay, gamma=ttt_step_loss_decay),
     )
+    # Denom used to normalize s_loss (= sum(loss_mask) + _EPS); detached so it
+    # can be all-reduced across SP ranks without entering the autograd graph.
+    s_denom = s_loss_mask.to(torch.float32).sum().detach()
 
     pred_ids = torch.argmax(s_logits, dim=-1)
     target_ids = torch.argmax(s_targets, dim=-1)
@@ -118,7 +124,71 @@ def compute_metrics(
     s_metrics[f"cond_acc_{ttt_step}_sum"] = cond_correct
     s_metrics[f"cond_acc_{ttt_step}_total"] = cond_total
 
-    return s_loss, s_metrics
+    return s_loss, s_metrics, s_denom
+
+
+def _checkpointed_chunk_loss(
+    c_hidden: torch.Tensor,
+    c_targets: torch.Tensor,
+    c_loss_mask: torch.Tensor,
+    pos_idx: torch.Tensor,
+    loss_config: LossConfig,
+    decay_fn: Callable[..., torch.Tensor] | None,
+    norm: torch.nn.Module,
+    lm_head: torch.nn.Module,
+    norm_output: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-chunk loss under ``torch.utils.checkpoint``.
+
+    Computes draft logits → weighted compound loss for one query chunk.  Wrapped
+    in checkpoint so that ``c_logits`` is freed after forward and recomputed
+    during backward — bounding the autograd graph's retained logits to a single
+    chunk (``O(chunk_size × V)``) instead of the full sequence (``O(S × V)``).
+
+    Also returns ``argmax(c_logits)`` (detached) so callers can compute accuracy
+    without a separate logits materialisation.
+
+    Returns:
+        ``(weighted_loss_sum, pred_ids)``.
+    """
+
+    def _run(
+        c_hidden: torch.Tensor,
+        c_targets: torch.Tensor,
+        c_loss_mask: torch.Tensor,
+        pos_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        _h = c_hidden if norm_output else norm(c_hidden)
+        c_logits = lm_head(_h)
+        chunk_loss = torch.tensor(
+            0.0, device=c_hidden.device, dtype=torch.float32
+        )
+        for _name, (fn, weight) in loss_config.items():
+            c_elem = fn(c_logits, c_targets) * c_loss_mask.to(c_logits.dtype)
+            if decay_fn is not None:
+                c_elem = c_elem * decay_fn(
+                    pos_idx.to(c_elem.dtype), elementwise_loss=c_elem
+                )
+            chunk_loss = chunk_loss + weight * c_elem.sum()
+        return chunk_loss
+
+    # use_reentrant=False is required for correctness when inputs are views
+    # (slices of hidden_states) and when non-tensor args are passed.
+    c_loss = checkpoint(
+        _run,
+        c_hidden,
+        c_targets,
+        c_loss_mask,
+        pos_idx,
+        use_reentrant=False,
+    )
+
+    # Argmax under no_grad for accuracy metrics (no autograd retention).
+    with torch.no_grad():
+        _h = c_hidden if norm_output else norm(c_hidden)
+        c_pred = torch.argmax(lm_head(_h), dim=-1)
+
+    return c_loss, c_pred
 
 
 def compute_metrics_chunked(
@@ -134,16 +204,21 @@ def compute_metrics_chunked(
     chunk_size: int = 512,
     *,
     norm_output: bool = False,
-) -> tuple[torch.Tensor, dict, torch.Tensor]:
+) -> tuple[torch.Tensor, dict, torch.Tensor, torch.Tensor]:
     """Chunked logits/loss path that never materializes full ``S × V`` tensors.
 
     Teacher targets are produced on-the-fly via ``target_fn(start, end)``.
-    Draft logits are computed per chunk from ``hidden_states``.
+    Draft logits are computed per chunk from ``hidden_states``.  Each chunk's
+    logits→loss segment is wrapped in ``torch.utils.checkpoint`` so that draft
+    logits are freed after forward and recomputed during backward — bounding
+    backward graph memory to ``O(chunk_size × V)`` instead of ``O(S × V)``.
 
     Returns:
-        ``(loss, metrics, argmax_ids)`` where ``argmax_ids`` has shape
-        ``[1, total_seq_len]`` (built chunk-wise under ``no_grad`` for the
-        next TTT input).
+        ``(loss, metrics, argmax_ids, loss_denom)`` where ``argmax_ids`` has
+        shape ``[1, total_seq_len]`` (built chunk-wise under ``no_grad`` for the
+        next TTT input) and ``loss_denom`` is the scalar count of masked
+        positions used to normalize ``loss`` (needed for correct SP gradient
+        scaling).
     """
     if loss_config is None:
         loss_config = {"kl_div": (kl_div_loss, 1.0)}
@@ -153,10 +228,13 @@ def compute_metrics_chunked(
     seq_len = total_seq_len - ttt_step
     if seq_len <= 0:
         zeros = torch.tensor(0.0, device=device)
+        _h = hidden_states[:, :1]
+        if not norm_output:
+            _h = norm(_h)
         empty_ids = torch.argmax(
-            lm_head(norm(hidden_states[:, :1])), dim=-1
+            lm_head(_h), dim=-1
         ).new_zeros(1, total_seq_len)
-        return zeros, {}, empty_ids
+        return zeros, {}, empty_ids, zeros.clone()
 
     s_loss_mask = (
         loss_mask[:, ttt_step:]
@@ -177,6 +255,7 @@ def compute_metrics_chunked(
     cond_correct_sum = torch.tensor(0.0, device=device)
     cond_total_sum = torch.tensor(0.0, device=device)
     term_sums: dict[str, torch.Tensor] = {}
+    multi_term = len(loss_config) > 1
 
     # Loss uses logits at [ttt_step + chunk) aligned with targets [ttt_step + chunk)
     # via align_for_step: logits[:, :-ttt] ↔ targets[:, ttt:].
@@ -186,15 +265,7 @@ def compute_metrics_chunked(
     for chunk_start in range(0, seq_len, chunk_size):
         chunk_end = min(chunk_start + chunk_size, seq_len)
         # Logits side after align_for_step uses hidden[:, :seq_len] (drop last ttt)
-        h_start = chunk_start
-        h_end = chunk_end
-        c_hidden = hidden_states[:, h_start:h_end]
-        if norm_output:
-            # Caller already applied norm to hidden_states when norm_output=True
-            c_logits = lm_head(c_hidden)
-        else:
-            c_logits = lm_head(norm(c_hidden))
-
+        c_hidden = hidden_states[:, chunk_start:chunk_end]
         c_targets = target_fn(ttt_step + chunk_start, ttt_step + chunk_end)
         c_loss_mask = s_loss_mask[:, chunk_start:chunk_end]
         c_prev = (
@@ -209,23 +280,43 @@ def compute_metrics_chunked(
             dtype=torch.long,
         )
 
-        # Weighted compound loss accumulated as sum/count for exact global mean
-        for name, (fn, weight) in loss_config.items():
-            c_elem = fn(c_logits, c_targets) * c_loss_mask.to(c_logits.dtype)
-            if decay_fn is not None:
-                c_elem = c_elem * decay_fn(
-                    pos_idx.to(c_elem.dtype), elementwise_loss=c_elem
-                )
-            loss_weighted_sum = loss_weighted_sum + weight * c_elem.sum()
-            if len(loss_config) > 1:
-                key = f"{name}_loss"
-                term_sums[key] = term_sums.get(key, torch.tensor(0.0, device=device)) + (
-                    c_elem.detach().sum()
-                )
+        # Checkpointed loss + argmax: logits are freed after forward and
+        # recomputed during backward, bounding autograd memory to one chunk's
+        # logits (O(chunk_size × V)) instead of the full sequence (O(S × V)).
+        c_loss, c_pred = _checkpointed_chunk_loss(
+            c_hidden,
+            c_targets,
+            c_loss_mask,
+            pos_idx,
+            loss_config,
+            decay_fn,
+            norm,
+            lm_head,
+            norm_output,
+        )
+        loss_weighted_sum = loss_weighted_sum + c_loss
+
+        # Per-term logging (only when multiple loss functions are configured).
+        # Recomputes logits under no_grad; peak memory is O(chunk_size × V) and
+        # freed immediately, so it does not defeat the checkpoint savings.
+        if multi_term:
+            with torch.no_grad():
+                _h = c_hidden if norm_output else norm(c_hidden)
+                _logits = lm_head(_h)
+                for name, (fn, _weight) in loss_config.items():
+                    c_elem = fn(_logits, c_targets) * c_loss_mask.to(_logits.dtype)
+                    if decay_fn is not None:
+                        c_elem = c_elem * decay_fn(
+                            pos_idx.to(c_elem.dtype), elementwise_loss=c_elem
+                        )
+                    key = f"{name}_loss"
+                    term_sums[key] = term_sums.get(
+                        key, torch.tensor(0.0, device=device)
+                    ) + c_elem.sum()
+                del _logits, _h
 
         loss_denom_sum = loss_denom_sum + c_loss_mask.to(torch.float32).sum()
 
-        c_pred = torch.argmax(c_logits, dim=-1)
         c_tgt_ids = torch.argmax(c_targets, dim=-1)
         fc, ft, cc, ct = compute_accuracy_single_step(
             c_pred, c_tgt_ids, c_loss_mask, c_prev
@@ -234,7 +325,7 @@ def compute_metrics_chunked(
         full_total_sum = full_total_sum + ft
         cond_correct_sum = cond_correct_sum + cc
         cond_total_sum = cond_total_sum + ct
-        del c_logits, c_targets, c_hidden
+        del c_hidden, c_targets
 
     s_loss = loss_weighted_sum / (loss_denom_sum + _EPS)
     ones = torch.tensor(1.0, device=device)
@@ -265,4 +356,4 @@ def compute_metrics_chunked(
             del c_logits
         argmax_ids = torch.cat(argmax_chunks, dim=1)
 
-    return s_loss, s_metrics, argmax_ids
+    return s_loss, s_metrics, argmax_ids, loss_denom_sum.detach()

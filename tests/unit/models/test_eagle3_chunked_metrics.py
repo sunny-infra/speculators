@@ -28,7 +28,7 @@ def test_chunked_metrics_matches_full():
 
     # Full path
     logits = lm_head(norm(hidden))
-    full_loss, full_metrics = compute_metrics(
+    full_loss, full_metrics, _full_denom = compute_metrics(
         logits,
         targets,
         loss_mask,
@@ -42,7 +42,7 @@ def test_chunked_metrics_matches_full():
         with torch.no_grad():
             return targets[:, start:end]
 
-    chunk_loss, chunk_metrics, argmax_ids = compute_metrics_chunked(
+    chunk_loss, chunk_metrics, argmax_ids, _chunk_denom = compute_metrics_chunked(
         hidden,
         norm,
         lm_head,

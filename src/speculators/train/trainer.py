@@ -390,7 +390,13 @@ class Trainer:
             opt.zero_grad()
 
     def _allreduce_sp_grads(self) -> None:
-        """Average gradients across the SP group (token-sharded loss → full-seq grad)."""
+        """Sum gradients across the SP group.
+
+        The per-rank loss is pre-scaled by ``(D_local / D_global)`` inside the
+        model forward (see ``_sp_scale_loss``), so a plain SUM across SP ranks
+        yields the exact global-loss gradient.  No averaging (``/ sp_size``) is
+        needed — that would double-count the ``1/D_global`` normalisation.
+        """
         sp_size = get_sp_size()
         sp_group = get_sp_group()
         if sp_size <= 1 or sp_group is None:
@@ -399,7 +405,6 @@ class Trainer:
             if param.grad is None:
                 continue
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=sp_group)
-            param.grad.div_(sp_size)
 
     def _optimizers_step(self):
         for opt in self.optimizers:
