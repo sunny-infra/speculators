@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import time
 import warnings
 from collections.abc import Callable
 from os import PathLike
@@ -274,6 +275,26 @@ class ArrowDataset(BaseDataset):
         return list(self.data.with_format(None)["seq_len"])
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
+        # Lazy local import to keep this module importable without the
+        # distributed training stack (e.g. when used from data-generation
+        # scripts). Reading these globals is safe inside dataloader worker
+        # processes — they are plain ints inherited via fork, no NCCL/gloo
+        # process group handle is touched here.
+        from speculators.train.distributed import get_sp_rank, get_sp_size
+
+        sp_size = get_sp_size()
+        sp_rank = get_sp_rank()
+
+        # SP rank >0 must NOT issue redundant vLLM requests: sp_rank=0 of the
+        # same DP group generates and atomically writes the cache file for
+        # this index; rank >0 polls the cache until it appears (or times
+        # out). This eliminates sp_size× redundant vLLM traffic while keeping
+        # the dataloader workers free of any dist ops (which are unsafe
+        # across fork).
+        if sp_size > 1 and sp_rank != 0:
+            return self._wait_for_sp_cache(self._map_to_file_idx(index))
+
+        # sp_size == 1 OR sp_rank == 0: original vLLM generation path.
         if not self.client:
             self._setup_client()
 
@@ -311,6 +332,36 @@ class ArrowDataset(BaseDataset):
             return None
 
         return loaded_hs
+
+    def _wait_for_sp_cache(
+        self,
+        file_idx: int,
+        *,
+        timeout: float | None = None,
+        poll_interval: float = 1.0,
+    ) -> dict[str, torch.Tensor] | None:
+        """Poll the hidden-states cache for ``file_idx`` until sp_rank=0 writes it.
+
+        Used by SP ranks >0 to avoid ``sp_size``× redundant vLLM requests.
+        ``timeout`` defaults to ``self.request_timeout`` (or 1800s if unset);
+        on timeout the function warns and returns ``None`` so the caller can
+        fall back to an empty sample (matching sp_rank=0's failure behavior).
+        """
+        effective_timeout = timeout or self.request_timeout or 1800.0
+        deadline = time.monotonic() + effective_timeout
+        while True:
+            cached = self.transfer.get_cached(file_idx)
+            if cached is not None:
+                return cached
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(poll_interval)
+        warnings.warn(
+            f"SP rank >0 timed out after {effective_timeout:.1f}s waiting for "
+            f"cache file_idx={file_idx}; sp_rank=0 likely failed.",
+            stacklevel=1,
+        )
+        return None
 
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)

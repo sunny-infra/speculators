@@ -145,7 +145,20 @@ class FileTransfer(HiddenStatesTransfer):
     def cache(self, handle: str, file_idx: int) -> None:
         self.hidden_states_path.mkdir(parents=True, exist_ok=True)
         target = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        shutil.move(handle, target)
+        # Atomic publish: stage to a per-process tmp file on the same
+        # filesystem as ``target``, then ``os.replace`` (atomic on POSIX) to
+        # the final name. This guarantees that any concurrent reader — in
+        # particular SP ranks >0 polling via :meth:`get_cached` — either
+        # observes the previous (or absent) file, or the fully-written new
+        # file, but never a partially-written one. ``shutil.move`` from
+        # ``handle`` to ``tmp_target`` may internally copy across
+        # filesystems, but that copy is invisible to readers because the
+        # final name is only created by the atomic rename below.
+        tmp_target = self.hidden_states_path / (
+            f".hs_{file_idx}.safetensors.tmp.{os.getpid()}"
+        )
+        shutil.move(handle, str(tmp_target))
+        os.replace(tmp_target, target)
 
     def delete(self, handle: str) -> None:
         Path(handle).unlink()
