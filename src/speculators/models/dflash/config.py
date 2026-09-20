@@ -7,10 +7,9 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from speculators import SpeculatorModelConfig
-from speculators.models.dflash.glm5 import (
-    GLM5_MLA_MODEL_TYPES,
-    Glm5Config,
-)
+from speculators.models.dflash.glm5 import Glm5Config  # noqa: F401
+from speculators.models.dflash.kimi_k3 import K3Config  # noqa: F401
+from speculators.models.dflash.mla import MLA_VARIANTS, mla_config_class
 
 __all__ = [
     "DFlashSpeculatorConfig",
@@ -85,6 +84,15 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    fc_norm: bool = Field(
+        default=False,
+        description=(
+            "Apply per-layer RMSNorm to each auxiliary hidden state before "
+            "concatenation and the context projection (TorchSpec K3 DSpark / "
+            "Eagle 3.1). Weight names are ``fc_norm.{i}.weight``."
+        ),
+    )
+
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
         """Serialize transformer config to dict."""
@@ -96,10 +104,10 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         """Validate and convert transformer config."""
         if isinstance(value, dict):
             model_type = value.get("model_type")
-            # Always construct local Glm5Config so glm5 / glm5_dspark never
-            # resolve to HuggingFace's GLM config via AutoConfig.for_model.
-            if model_type in GLM5_MLA_MODEL_TYPES:
-                return Glm5Config(**value)
+            # Always construct the local MLA config class so glm5 / k3_dspark
+            # never resolve to a HuggingFace config via AutoConfig.for_model.
+            if model_type in MLA_VARIANTS:
+                return mla_config_class(model_type)(**value)
             config_class: type[PretrainedConfig] = Qwen3Config
             if "model_type" in value:
                 config_class = AutoConfig.for_model(

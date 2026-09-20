@@ -218,6 +218,67 @@ def test_q_lora_rank_accepted_with_glm5(monkeypatch):
     assert args.draft_arch == "glm5"
 
 
+def test_dspark_accepts_k3_draft_arch(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        ["--speculator-type", "dspark", "--draft-arch", "k3"],
+    )
+    assert args.draft_arch == "k3"
+    assert args.fc_norm is True
+
+
+def test_eagle3_rejects_k3_draft_arch(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, ["--draft-arch", "k3"])
+
+
+def test_q_lora_rank_accepted_with_k3(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--draft-arch",
+            "k3",
+            "--q-lora-rank",
+            "32",
+        ],
+    )
+    assert args.q_lora_rank == 32
+    assert args.draft_arch == "k3"
+
+
+def test_dspark_k3_draft_config_without_draft_arch(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--draft-config",
+            "k3_draft_mla_config.json",
+            "--fc-norm",
+        ],
+    )
+    assert args.draft_config == "k3_draft_mla_config.json"
+    assert args.fc_norm is True
+    assert args.draft_arch == "qwen3"
+
+
+def test_draft_arch_conflicts_with_draft_config(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark",
+                "--draft-arch",
+                "k3",
+                "--draft-config",
+                "k3_draft_mla_config.json",
+            ],
+        )
+
+
 def test_q_lora_rank_rejects_negative(monkeypatch):
     with pytest.raises(SystemExit):
         _parse(

@@ -193,6 +193,43 @@ def test_q_lora_rank_accepted_with_glm5_draft_arch():
     assert cfg.draft.kv_lora_rank == 16
 
 
+def test_k3_draft_arch_accepted_for_dflash_and_dspark():
+    dflash = TrainConfig(
+        speculator_type="dflash",
+        draft=DraftArgs(draft_arch="k3"),
+    )
+    dspark = TrainConfig(
+        speculator_type="dspark",
+        draft=DraftArgs(draft_arch="k3"),
+    )
+    assert dflash.draft.draft_arch == "k3"
+    assert dspark.draft.draft_arch == "k3"
+    assert dspark.draft.fc_norm is True
+
+
+def test_k3_draft_arch_rejected_for_eagle3():
+    with pytest.raises(ValidationError, match="only supported"):
+        TrainConfig(draft=DraftArgs(draft_arch="k3"))
+
+
+def test_q_lora_rank_accepted_with_k3_draft_arch():
+    cfg = TrainConfig(
+        speculator_type="dspark",
+        draft=DraftArgs(draft_arch="k3", q_lora_rank=32, kv_lora_rank=16),
+    )
+    assert cfg.draft.q_lora_rank == 32
+    assert cfg.draft.kv_lora_rank == 16
+
+
+def test_q_lora_rank_accepted_with_mla_draft_config():
+    cfg = TrainConfig(
+        speculator_type="dspark",
+        draft=DraftArgs(draft_config="k3_draft_mla_config.json", q_lora_rank=32),
+    )
+    assert cfg.draft.q_lora_rank == 32
+    assert cfg.draft.draft_config == "k3_draft_mla_config.json"
+
+
 def test_q_lora_rank_rejects_negative():
     with pytest.raises(ValidationError):
         TrainConfig(

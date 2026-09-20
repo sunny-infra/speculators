@@ -42,7 +42,8 @@ exec torchrun --standalone --nproc-per-node 4 \
   scripts/train.py \
   --verifier-name-or-path "$model_path" \
   --trust-remote-code \
-  --draft-config "$script_dir/k3_draft_layer_config.json" \
+  --draft-config "$script_dir/k3_draft_mla_config.json" \
+  --fc-norm \
   --data-path "$data_dir" \
   --save-path "$run_dir/checkpoints" \
   --mask-token-id 163837 \
@@ -51,7 +52,7 @@ exec torchrun --standalone --nproc-per-node 4 \
   --total-seq-len 8192 \
   --train-data-ratio 0.999 \
   --speculator-type dspark \
-  --target-layer-ids 24 48 72 88 92 \
+  --target-layer-ids 7 31 47 63 87 \
   --block-size 8 \
   --max-anchors 1024 \
   --dflash-decay-gamma 4.0 \

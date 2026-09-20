@@ -19,10 +19,13 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from hs_connectors import HiddenStatesBackend
 from speculators.model import SpeculatorModel
-from speculators.models.dflash.glm5 import (
-    GLM5_MLA_MODEL_TYPES,
-    Glm5Config,
-    is_glm5_mla_config,
+from speculators.models.dflash.glm5 import Glm5Config
+from speculators.models.dflash.kimi_k3 import K3_DEFAULT_ROPE_PARAMETERS, K3Config
+from speculators.models.dflash.mla import (
+    MLA_DRAFT_ARCHES,
+    MLA_VARIANTS,
+    is_mla_config,
+    mla_config_class,
     mla_kwargs_from_verifier,
 )
 from speculators.models.eagle3.data import shift_batch
@@ -59,6 +62,7 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "llama": LlamaConfig,
     "qwen3": Qwen3Config,
     "glm5": Glm5Config,
+    "k3": K3Config,
 }
 MROPE_INVERSE_TOLERANCE = 1e-6
 
@@ -168,9 +172,11 @@ def create_transformer_layer_config(  # noqa: C901
 
     # GQA drafts sometimes rewrite n_heads from hidden_size / head_dim when the
     # verifier's MLA head_dim does not divide hidden_size into n_heads. Dense
-    # MLA must keep the verifier head count — kv is compressed by lora rank.
+    # MLA must keep the verifier head count — kv is compressed by lora rank —
+    # except K3, whose draft geometry (64 heads / 14336 FFN) does not follow
+    # the verifier (96 heads / 33792 FFN).
     if (
-        draft_arch != "glm5"
+        draft_arch not in MLA_DRAFT_ARCHES
         and head_dim
         and verifier_config.hidden_size % num_attention_heads != 0
         and verifier_config.hidden_size % head_dim == 0
@@ -178,7 +184,7 @@ def create_transformer_layer_config(  # noqa: C901
         num_attention_heads = verifier_config.hidden_size // head_dim
         if num_attention_heads % num_key_value_heads != 0:
             num_key_value_heads = num_attention_heads
-    if draft_arch == "glm5":
+    if draft_arch in MLA_DRAFT_ARCHES:
         qk_rope = getattr(verifier_config, "qk_rope_head_dim", None)
         resolved_head_dim = (
             qk_rope or head_dim or verifier_config.hidden_size // num_attention_heads
@@ -203,10 +209,7 @@ def create_transformer_layer_config(  # noqa: C901
     config_kwargs: dict = {
         "vocab_size": verifier_config.vocab_size,
         "hidden_size": verifier_config.hidden_size,
-        "intermediate_size": resolve_draft_intermediate_size(verifier_config),
         "num_hidden_layers": num_layers,
-        "num_attention_heads": num_attention_heads,
-        "num_key_value_heads": num_key_value_heads,
         "hidden_act": hidden_act,
         "max_position_embeddings": verifier_config.max_position_embeddings,
         "initializer_range": verifier_config.initializer_range,
@@ -217,7 +220,14 @@ def create_transformer_layer_config(  # noqa: C901
         "use_sliding_window": "sliding_attention" in layer_types,
         "layer_types": layer_types,
     }
-    if draft_arch == "glm5":
+    if draft_arch != "k3":
+        # K3Config defaults: 64 heads, intermediate_size=14336 (not the verifier).
+        config_kwargs["intermediate_size"] = resolve_draft_intermediate_size(
+            verifier_config
+        )
+        config_kwargs["num_attention_heads"] = num_attention_heads
+        config_kwargs["num_key_value_heads"] = num_key_value_heads
+    if draft_arch in MLA_DRAFT_ARCHES:
         config_kwargs.update(mla_kwargs_from_verifier(verifier_config))
     config = config_class(**config_kwargs)
 
@@ -273,42 +283,53 @@ def create_transformer_layer_config(  # noqa: C901
             config.rope_scaling = rope_scaling
         config.rope_theta = getattr(verifier_config, "rope_theta", 10000.0)
 
+    if draft_arch == "k3":
+        rope = dict(K3_DEFAULT_ROPE_PARAMETERS)
+        existing = getattr(config, "rope_parameters", None)
+        if isinstance(existing, dict) and existing.get("rope_type") == "yarn":
+            rope.update({k: v for k, v in existing.items() if v is not None})
+        config.rope_parameters = rope
+
     return config
 
 
-def _apply_glm5_lora_rank_overrides(
+def _apply_mla_lora_rank_overrides(
     transformer_layer_config: PretrainedConfig,
     args: argparse.Namespace,
 ) -> None:
-    """Apply ``--q-lora-rank`` / ``--kv-lora-rank`` onto a glm5 draft decoder.
+    """Apply ``--q-lora-rank`` / ``--kv-lora-rank`` onto an MLA draft decoder.
 
     ``q_lora_rank=0`` disables Q LoRA (full ``q_proj``). Negative ranks are
     rejected; ``kv_lora_rank`` must be strictly positive.
     """
-    if not is_glm5_mla_config(transformer_layer_config):
+    if not is_mla_config(transformer_layer_config):
         if args.q_lora_rank is not None or args.kv_lora_rank is not None:
             raise ValueError(
                 "--q-lora-rank / --kv-lora-rank require --draft-arch glm5 "
-                "(or a glm5 --draft-config)."
+                "or k3 (or an MLA --draft-config)."
             )
         return
     if args.q_lora_rank is not None:
         if args.q_lora_rank < 0:
             raise ValueError("--q-lora-rank must be >= 0")
-        # 0 disables Q LoRA (full q_proj), matching Glm5DFlashMLAAttention.
+        # 0 disables Q LoRA (full q_proj), matching MlaDFlashAttention.
         transformer_layer_config.q_lora_rank = (
             None if args.q_lora_rank == 0 else int(args.q_lora_rank)
         )
         logger.info(
-            "Overriding glm5 q_lora_rank=%s", transformer_layer_config.q_lora_rank
+            "Overriding MLA q_lora_rank=%s", transformer_layer_config.q_lora_rank
         )
     if args.kv_lora_rank is not None:
         if args.kv_lora_rank <= 0:
             raise ValueError("--kv-lora-rank must be > 0")
         transformer_layer_config.kv_lora_rank = int(args.kv_lora_rank)
         logger.info(
-            "Overriding glm5 kv_lora_rank=%s", transformer_layer_config.kv_lora_rank
+            "Overriding MLA kv_lora_rank=%s", transformer_layer_config.kv_lora_rank
         )
+
+
+# Kept for GLM-5 unit tests that import this name.
+_apply_glm5_lora_rank_overrides = _apply_mla_lora_rank_overrides
 
 
 def load_draft_transformer_layer_config(
@@ -321,8 +342,9 @@ def load_draft_transformer_layer_config(
     ``draft_config`` may be a HF hub id, a local directory containing a
     ``config.json``, or a path to a config JSON file. It is expected to hold a
     plain decoder config (``LlamaConfig`` for eagle3/peagle, ``Qwen3Config`` or
-    ``Glm5Config`` for dflash/dspark). If a full speculator config is given instead,
-    its nested ``transformer_layer_config`` is extracted as a convenience.
+    an MLA config (``Glm5Config`` / ``K3Config``) for dflash/dspark). If a full
+    speculator config is given instead, its nested ``transformer_layer_config``
+    is extracted as a convenience.
 
     The decoder is reconciled against the verifier: ``hidden_size`` must match
     (draft/verifier hidden-size mismatch is not yet supported) and ``vocab_size``
@@ -338,11 +360,11 @@ def load_draft_transformer_layer_config(
     if not model_type:
         raise ValueError(
             "--draft-config must define a 'model_type' (e.g. 'llama' for "
-            "eagle3/peagle, 'qwen3' or 'glm5' for dflash/dspark); none was found "
-            f"in the config loaded from '{draft_config}'."
+            "eagle3/peagle, 'qwen3', 'glm5', or 'k3_dspark' for dflash/dspark); "
+            f"none was found in the config loaded from '{draft_config}'."
         )
-    if model_type in GLM5_MLA_MODEL_TYPES:
-        config_class: type[PretrainedConfig] = Glm5Config
+    if model_type in MLA_VARIANTS:
+        config_class: type[PretrainedConfig] = mla_config_class(model_type)
     else:
         config_class = type(AutoConfig.for_model(model_type))
     draft_config_obj = config_class.from_dict(config_dict)
@@ -604,7 +626,7 @@ def build_draft_model(
                 trust_remote_code=args.trust_remote_code,
             )
 
-        _apply_glm5_lora_rank_overrides(transformer_layer_config, args)
+        _apply_mla_lora_rank_overrides(transformer_layer_config, args)
 
         args.mask_token_id = resolve_mask_token_id(
             args.verifier_name_or_path,

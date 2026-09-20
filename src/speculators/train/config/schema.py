@@ -95,11 +95,12 @@ class DraftArgs(_Group):
         description="Number of draft decoder layers to synthesize. "
         "(default: 5 for dflash/dspark/dflash2, 1 otherwise).",
     )
-    draft_arch: Literal["llama", "qwen3", "glm5"] | None = Field(
+    draft_arch: Literal["llama", "qwen3", "glm5", "k3"] | None = Field(
         default=None,
         description="Architecture for draft decoder layers "
         "(default: 'llama' for eagle3, 'qwen3' otherwise). "
-        "'glm5' selects Dense MLA layers for DFlash/DSpark (GLM-5.x).",
+        "'glm5' selects Dense MLA layers for DFlash/DSpark (GLM-5.x). "
+        "'k3' selects Kimi-K3 Dense MLA layers (YaRN, 64 heads).",
     )
     draft_hidden_act: str = Field(
         default="silu",
@@ -196,14 +197,14 @@ class DraftArgs(_Group):
     q_lora_rank: int | None = Field(
         default=None,
         ge=0,
-        description="Override glm5 draft Q LoRA rank (default: copy verifier "
+        description="Override MLA draft Q LoRA rank (default: copy verifier "
         "q_lora_rank). Set 0 to use a full q_proj instead of q_a/q_b. "
-        "Negative values are rejected.",
+        "Requires --draft-arch glm5 or k3. Negative values are rejected.",
     )
     kv_lora_rank: int | None = Field(
         default=None,
-        description="Override glm5 draft KV LoRA rank (default: copy verifier "
-        "kv_lora_rank).",
+        description="Override MLA draft KV LoRA rank (default: copy verifier "
+        "kv_lora_rank). Requires --draft-arch glm5 or k3.",
     )
 
 
@@ -750,26 +751,34 @@ class TrainConfig(BaseSettings):
             self.loss.loss_fn = "ce" if is_dflash else "kl_div"
         if self.dflash.block_size is None:
             self.dflash.block_size = 16 if is_dflash else 8
+        if self.draft.draft_arch == "k3":
+            # TorchSpec K3 DSpark norms each aux stream before context_proj.
+            self.draft.fc_norm = True
         return self
 
     @model_validator(mode="after")
-    def _validate_glm5_draft(self) -> "TrainConfig":
-        """``glm5`` is DFlash/DSpark-only; LoRA rank overrides require glm5."""
-        if self.draft.draft_arch == "glm5" and self.speculator_type not in (
+    def _validate_mla_draft(self) -> "TrainConfig":
+        """MLA draft arches are DFlash/DSpark-only; LoRA rank overrides require them."""
+        mla_arches = ("glm5", "k3")
+        if self.draft.draft_arch in mla_arches and self.speculator_type not in (
             "dflash",
             "dspark",
         ):
             raise ValueError(
-                "--draft-arch glm5 is only supported for --speculator-type dflash "
-                "or dspark."
+                f"--draft-arch {self.draft.draft_arch} is only supported for "
+                "--speculator-type dflash or dspark."
             )
         lora_set = (
             self.draft.q_lora_rank is not None or self.draft.kv_lora_rank is not None
         )
-        if lora_set and self.draft.draft_arch != "glm5" and not self.draft.draft_config:
+        if (
+            lora_set
+            and self.draft.draft_arch not in mla_arches
+            and not self.draft.draft_config
+        ):
             raise ValueError(
                 "--q-lora-rank / --kv-lora-rank require --draft-arch glm5 "
-                "(or a glm5 --draft-config)."
+                "or k3 (or an MLA --draft-config)."
             )
         return self
 

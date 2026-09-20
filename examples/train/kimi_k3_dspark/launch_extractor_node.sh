@@ -70,6 +70,6 @@ exec "$vllm_python" scripts/launch_vllm.py "$model_path" \
   --mooncake-global-segment-gib 32 \
   --mooncake-local-buffer-gib 4 \
   --mooncake-writer-threads 4 \
-  --target-layer-ids 24 48 72 88 92 \
+  --target-layer-ids 7 31 47 63 87 \
   --trust-remote-code \
   -- "${vllm_args[@]}"

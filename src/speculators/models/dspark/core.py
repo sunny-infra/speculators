@@ -63,20 +63,25 @@ class DSparkDraftModel(DFlashDraftModel):
             self.confidence_head = ConfidenceHead(input_dim)
 
     def save_pretrained(self, save_directory, **kwargs):  # noqa: ANN001
-        """Persist GLM-5 MLA drafts under the vLLM-Ascend architecture name.
+        """Persist MLA drafts under their serve-side architecture name.
 
         HuggingFace ``PreTrainedModel.save_pretrained`` overwrites
         ``config.architectures`` with this Python class name. Restore the
-        K3-style export contract afterwards so serve can dispatch
-        ``Glm5DSparkForCausalLM``. Hub upload is deferred until after that
-        rewrite so ``push_to_hub=True`` does not ship ``DSparkDraftModel``.
+        family export contract afterwards so serve can dispatch
+        ``Glm5DSparkForCausalLM`` / ``K3DSparkModel``. Hub upload is deferred
+        until after that rewrite so ``push_to_hub=True`` does not ship
+        ``DSparkDraftModel``.
         """
-        from speculators.models.dflash.glm5 import (  # noqa: PLC0415
-            GLM5_DSPARK_ARCHITECTURE,
-            is_glm5_mla_config,
+        from speculators.models.dflash.mla import (  # noqa: PLC0415
+            is_mla_config,
+            mla_export_architecture,
         )
 
-        if not is_glm5_mla_config(self.config.transformer_layer_config):
+        export_arch = mla_export_architecture(self.config.transformer_layer_config)
+        if (
+            not is_mla_config(self.config.transformer_layer_config)
+            or export_arch is None
+        ):
             super().save_pretrained(save_directory, **kwargs)
             return
 
@@ -106,7 +111,7 @@ class DSparkDraftModel(DFlashDraftModel):
             files_timestamps = self._get_files_timestamps(save_directory)
 
         super().save_pretrained(save_directory, push_to_hub=False, **kwargs)
-        self.config.architectures = [GLM5_DSPARK_ARCHITECTURE]
+        self.config.architectures = [export_arch]
         self.config.save_pretrained(save_directory)
         if push_to_hub:
             self._upload_modified_files(

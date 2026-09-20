@@ -16,11 +16,13 @@ from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.attention import create_anchor_block_mask_mod
-from speculators.models.dflash.glm5 import (
-    Glm5DFlashDecoderLayer,
-    is_glm5_mla_config,
+from speculators.models.dflash.kimi_k3 import (
+    K3_ROTARY_CACHE_CAP,
+    assert_k3_yarn_attention_scaling_identity,
+    is_k3_mla_config,
 )
 from speculators.models.dflash.metrics import compute_metrics
+from speculators.models.dflash.mla import is_mla_config, mla_layer_class
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
 from speculators.models.dflash.utils import (
     get_base_indices_for_anchored_blocks,
@@ -43,8 +45,13 @@ _compiled_create_block_mask = torch.compile(create_block_mask)
 @SpeculatorModel.register("dflash")
 class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     config_class: ClassVar[type[DFlashSpeculatorConfig]] = DFlashSpeculatorConfig  # type: ignore[misc]
-    supports_gradient_checkpointing = True  # noqa: D003  # Qwen3 / Glm5 DFlash layers inherit GradientCheckpointingLayer
-    _no_split_modules = ["Qwen3DFlashDecoderLayer", "Glm5DFlashDecoderLayer"]
+    supports_gradient_checkpointing = True  # noqa: D003  # Qwen3 / MLA DFlash layers inherit GradientCheckpointingLayer
+    _no_split_modules = [
+        "Qwen3DFlashDecoderLayer",
+        "Glm5DFlashDecoderLayer",
+        "K3DFlashDecoderLayer",
+        "MlaDFlashDecoderLayer",
+    ]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
         "verifier_norm.weight",
@@ -73,9 +80,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         attention and MLP with additional modules.
         """
         decoder_layer_class = (
-            Glm5DFlashDecoderLayer
-            if is_glm5_mla_config(config.transformer_layer_config)
-            else Qwen3DFlashDecoderLayer
+            mla_layer_class(config.transformer_layer_config) or Qwen3DFlashDecoderLayer
         )
         return decoder_layer_class(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
 
@@ -123,22 +128,36 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        # GLM-5 MLA RoPE only covers qk_rope_head_dim (interleaved pairs); Qwen3
+        # MLA RoPE only covers qk_rope_head_dim (interleaved pairs); Qwen3
         # GQA RoPE covers the full head_dim. Build the cache at the active width
         # without mutating transformer_layer_config.head_dim.
         rotary_config = flatten_rope_parameters(config.transformer_layer_config)
-        if is_glm5_mla_config(tl_config):
+        if is_mla_config(tl_config):
             rotary_config = deepcopy(rotary_config)
             rotary_config.head_dim = tl_config.qk_rope_head_dim
+            if is_k3_mla_config(tl_config):
+                max_pos = int(getattr(rotary_config, "max_position_embeddings", 0))
+                if max_pos > K3_ROTARY_CACHE_CAP:
+                    rotary_config.max_position_embeddings = K3_ROTARY_CACHE_CAP
         self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
+        if is_k3_mla_config(tl_config):
+            assert_k3_yarn_attention_scaling_identity(self.rotary_emb)
 
         context_in = (
             len(self.target_layer_ids) * config.transformer_layer_config.hidden_size
         )
         context_out = config.transformer_layer_config.hidden_size
         context_eps = config.transformer_layer_config.rms_norm_eps
-        if is_glm5_mla_config(tl_config):
-            # K3 / vLLM-Ascend export contract: context_proj + context_norm.
+        self.fc_norm: nn.ModuleList | None = None
+        if config.fc_norm:
+            self.fc_norm = nn.ModuleList(
+                [
+                    Qwen3RMSNorm(context_out, eps=context_eps)  # type: ignore[arg-type]
+                    for _ in self.target_layer_ids
+                ]
+            )
+        if is_mla_config(tl_config):
+            # TorchSpec / vLLM-Ascend export contract: context_proj + context_norm.
             self.context_proj = nn.Linear(context_in, context_out, bias=False)
             self.context_norm = Qwen3RMSNorm(context_out, eps=context_eps)  # type: ignore[arg-type]
         else:
@@ -282,6 +301,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": sliding_window_non_causal,
             "sample_from_anchor": sample_from_anchor,
+            "fc_norm": (
+                True
+                if is_k3_mla_config(verifier_config)
+                else bool(kwargs.get("fc_norm", False))
+            ),
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
@@ -393,10 +417,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     def _project_context(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project concatenated target aux hiddens into draft width.
 
-        GLM-5 MLA drafts export K3 names (``context_proj`` / ``context_norm``);
-        Qwen3 GQA drafts keep ``fc`` / ``hidden_norm``.
+        MLA drafts export TorchSpec names (``context_proj`` / ``context_norm``);
+        Qwen3 GQA drafts keep ``fc`` / ``hidden_norm``. Optional ``fc_norm``
+        RMSNorms each aux-layer chunk before the projection.
         """
-        if is_glm5_mla_config(self.config.transformer_layer_config):
+        if self.fc_norm is not None:
+            chunks = hidden_states.chunk(len(self.fc_norm), dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks, strict=True)],
+                dim=-1,
+            )
+        if is_mla_config(self.config.transformer_layer_config):
             return self.context_norm(self.context_proj(hidden_states))
         return self.hidden_norm(self.fc(hidden_states))
 
