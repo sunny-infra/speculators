@@ -1,0 +1,14 @@
+scripts/plot_curves.py
+  h_dc29e7c5e1c0e7 1-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "de7ee2cfdfe92607bc403cd674c4879f656e2744",
+  "prompts": {},
+  "humans": {
+    "h_dc29e7c5e1c0e7": {
+      "author": "sunny-infra <sunyu_0904@163.com>"
+    }
+  }
+}
