@@ -5,8 +5,12 @@ Hidden states stay bf16 and keep all Eagle aux layers. They are copied
 DtoH on TP0 each step into per-request CPU pages; request_finished writes
 safetensors from those pages. MLA/indexer KV stays on NPU.
 
-Safe to re-run: each target file is skipped when the HS_CPU_PAGES marker
-is already present.
+When the engine prefix cache is on, TP0 also keeps a block-hash → HS
+index so a later request can copy cached prefix rows instead of leaving
+holes. The index is off whenever enable_prefix_caching is false.
+
+Safe to re-run: files with HS_CPU_PREFIX_HASH are skipped. Connectors
+that only have HS_CPU_PAGES are upgraded in place.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import time
 from pathlib import Path
 
 MARKER = "HS_CPU_PAGES"
+PREFIX_MARKER = "HS_CPU_PREFIX_HASH"
 
 SITE = Path("/usr/local/python3.11.15/lib/python3.11/site-packages")
 
@@ -215,12 +220,35 @@ class PendingSave:
         self.cache_layers: list[str] = []  # set by self.register_kv_caches
         self._cpu_pages: dict[str, torch.Tensor] = {}
         self._hs_staging: torch.Tensor | None = None
+        from collections import OrderedDict
+        cc = vllm_config.cache_config
+        self._hs_prefix_index_on = bool(
+            self._hs_store_cpu and getattr(cc, "enable_prefix_caching", False)
+        )
+        self._hs_hash_blocks: OrderedDict = OrderedDict()
+        self._hs_hash_tokens = 0
+        self._hs_prefix_max_tokens = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "hs_prefix_cache_max_tokens", 131072
+            )
+        )
+        self._req_block_hashes: dict[str, list] = {}
         logger.info(self._kv_transfer_config)
         logger.info("Shared storage path is %s", self._storage_path)
         if self._hs_store_cpu:
             logger.info(
                 "HS_CPU_PAGES: hidden states stored on TP0 CPU, not in NPU KV"
             )
+            if self._hs_prefix_index_on:
+                logger.info(
+                    "HS_CPU_PREFIX_HASH: enabled max_tokens=%s block_size=%s",
+                    self._hs_prefix_max_tokens,
+                    self._block_size,
+                )
+            else:
+                logger.info(
+                    "HS_CPU_PREFIX_HASH: disabled (engine prefix cache off)"
+                )
 """
     text = _replace_once(text, old_init, new_init, "connector.__init__")
 
@@ -269,7 +297,119 @@ class PendingSave:
     old_write = """    @staticmethod
     def _write_tensors(
 """
-    new_write = '''    def save_hs_batch(
+    new_write = '''    def _hs_prefix_enabled(self) -> bool:
+        return bool(
+            getattr(self, "_hs_store_cpu", False)
+            and getattr(self, "_hs_prefix_index_on", False)
+            and getattr(self, "_is_tp_rank_zero", False)
+        )
+
+    def _block_extra_keys(self, req_state):
+        extra = []
+        lora = getattr(req_state, "lora_request", None)
+        if lora is not None:
+            extra.append(getattr(lora, "lora_name", None) or str(lora))
+        return tuple(extra) if extra else None
+
+    def _ensure_req_hashes(self, req_id, requests, n_blocks):
+        hashes = self._req_block_hashes.setdefault(req_id, [])
+        if n_blocks <= 0 or len(hashes) >= n_blocks:
+            return hashes[: max(n_blocks, 0)]
+        if requests is None or req_id not in requests:
+            return hashes
+        from vllm.utils.hashing import get_hash_fn_by_name
+        from vllm.v1.core import kv_cache_utils as _kvu
+        from vllm.v1.core.kv_cache_utils import hash_block_tokens, init_none_hash
+
+        st = requests[req_id]
+        ids = list(st.prompt_token_ids or [])
+        ids.extend(st.output_token_ids or [])
+        bs = int(self._block_size)
+        algo = getattr(
+            self._vllm_config.cache_config, "prefix_caching_hash_algo", "sha256"
+        )
+        hash_fn = get_hash_fn_by_name(algo)
+        if getattr(_kvu, "NONE_HASH", None) is None:
+            init_none_hash(hash_fn)
+        extra = self._block_extra_keys(st)
+        while len(hashes) < n_blocks:
+            i = len(hashes)
+            lo = i * bs
+            hi = lo + bs
+            if hi > len(ids):
+                break
+            prev = hashes[-1] if hashes else None
+            hashes.append(hash_block_tokens(hash_fn, prev, ids[lo:hi], extra))
+        return hashes
+
+    def _evict_hs_hash_blocks(self) -> None:
+        max_tok = int(getattr(self, "_hs_prefix_max_tokens", 0) or 0)
+        blocks = getattr(self, "_hs_hash_blocks", None)
+        if blocks is None or max_tok <= 0:
+            return
+        while self._hs_hash_tokens > max_tok and blocks:
+            _, old = blocks.popitem(last=False)
+            self._hs_hash_tokens -= int(old.shape[0])
+
+    def _fill_prefix_from_hash(self, req_id, page, n_prefix, requests) -> int:
+        # HS_CPU_PREFIX_HASH: copy cached full blocks into a new request page.
+        if not self._hs_prefix_enabled() or n_prefix <= 0:
+            return 0
+        bs = int(self._block_size)
+        n_blocks = n_prefix // bs
+        if n_blocks <= 0:
+            return 0
+        hashes = self._ensure_req_hashes(req_id, requests, n_blocks)
+        copied = 0
+        for i, h in enumerate(hashes[:n_blocks]):
+            blk = self._hs_hash_blocks.get(h)
+            if blk is None:
+                logger.warning(
+                    "HS_CPU_PREFIX_HASH: miss req_id=%s block=%s/%s",
+                    req_id,
+                    i,
+                    n_blocks,
+                )
+                break
+            lo = i * bs
+            hi = lo + bs
+            if page.shape[0] < hi or blk.shape[0] != bs:
+                break
+            page[lo:hi].copy_(blk)
+            self._hs_hash_blocks.move_to_end(h)
+            copied += 1
+        if copied:
+            logger.info(
+                "HS_CPU_PREFIX_HASH: filled %s/%s prefix blocks req_id=%s",
+                copied,
+                n_blocks,
+                req_id,
+            )
+        return copied * bs
+
+    def _publish_full_blocks(self, req_id, page, start, need, requests) -> None:
+        if not self._hs_prefix_enabled() or need <= start:
+            return
+        bs = int(self._block_size)
+        first = start // bs
+        last = need // bs
+        if last <= first:
+            return
+        hashes = self._ensure_req_hashes(req_id, requests, last)
+        for i in range(first, min(last, len(hashes))):
+            h = hashes[i]
+            if h in self._hs_hash_blocks:
+                self._hs_hash_blocks.move_to_end(h)
+                continue
+            lo = i * bs
+            hi = lo + bs
+            if page.shape[0] < hi:
+                break
+            self._hs_hash_blocks[h] = page[lo:hi].contiguous().clone()
+            self._hs_hash_tokens += bs
+        self._evict_hs_hash_blocks()
+
+    def save_hs_batch(
         self,
         hidden_states: torch.Tensor,
         common_attn_metadata,
@@ -279,8 +419,9 @@ class PendingSave:
         """DtoH this step's hidden states into per-request CPU pages (TP0).
 
         HS_CPU_PAGES. ``hidden_states`` is [num_tokens, num_layers, hidden].
-        Logical write offset is ``num_computed_tokens`` for each request so
-        chunked prefill concatenates; prefix-cache hits leave earlier rows.
+        Logical write offset is ``num_computed_tokens`` so chunked prefill
+        concatenates. HS_CPU_PREFIX_HASH: a new request with prefix-cache
+        hits copies cached CPU blocks into [0, num_computed_tokens).
         """
         if not getattr(self, "_hs_store_cpu", False):
             return
@@ -405,6 +546,7 @@ class PendingSave:
                 except Exception:
                     cap = need
             page = self._cpu_pages.get(req_id)
+            page_is_new = page is None
             if page is None or page.shape[0] < need:
                 try:
                     new_page = torch.empty(
@@ -423,7 +565,10 @@ class PendingSave:
                     new_page[: page.shape[0]].copy_(page)
                 self._cpu_pages[req_id] = new_page
                 page = new_page
+            if page_is_new and start > 0:
+                self._fill_prefix_from_hash(req_id, page, start, requests)
             page[start:need].copy_(staging[q0:q1])
+            self._publish_full_blocks(req_id, page, start, need, requests)
 
     @staticmethod
     def _write_tensors(
@@ -436,13 +581,16 @@ class PendingSave:
 """
     new_submit = """        if not self._is_tp_rank_zero:
             self._cpu_pages.pop(pending.req_id, None)
+            self._req_block_hashes.pop(pending.req_id, None)
             return
         if getattr(self, "_hs_store_cpu", False):
             # HS_CPU_PAGES: finish is CPU concat + save_file, no NPU gather.
             if pending.discard:
                 self._cpu_pages.pop(pending.req_id, None)
+                self._req_block_hashes.pop(pending.req_id, None)
                 return
             page = self._cpu_pages.pop(pending.req_id, None)
+            self._req_block_hashes.pop(pending.req_id, None)
             num_tokens = int(pending.token_ids.shape[0])
             if page is None:
                 logger.error(
@@ -524,6 +672,282 @@ class PendingSave:
     )
 
 
+def upgrade_connector_prefix_hash(text: str) -> str:
+    """Upgrade an HS_CPU_PAGES connector to add HS_CPU_PREFIX_HASH."""
+    old_init_tail = """        self._cpu_pages: dict[str, torch.Tensor] = {}
+        self._hs_staging: torch.Tensor | None = None
+        logger.info(self._kv_transfer_config)
+        logger.info("Shared storage path is %s", self._storage_path)
+        if self._hs_store_cpu:
+            logger.info(
+                "HS_CPU_PAGES: hidden states stored on TP0 CPU, not in NPU KV"
+            )
+"""
+    new_init_tail = """        self._cpu_pages: dict[str, torch.Tensor] = {}
+        self._hs_staging: torch.Tensor | None = None
+        from collections import OrderedDict
+        cc = vllm_config.cache_config
+        self._hs_prefix_index_on = bool(
+            self._hs_store_cpu and getattr(cc, "enable_prefix_caching", False)
+        )
+        self._hs_hash_blocks: OrderedDict = OrderedDict()
+        self._hs_hash_tokens = 0
+        self._hs_prefix_max_tokens = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "hs_prefix_cache_max_tokens", 131072
+            )
+        )
+        self._req_block_hashes: dict[str, list] = {}
+        logger.info(self._kv_transfer_config)
+        logger.info("Shared storage path is %s", self._storage_path)
+        if self._hs_store_cpu:
+            logger.info(
+                "HS_CPU_PAGES: hidden states stored on TP0 CPU, not in NPU KV"
+            )
+            if self._hs_prefix_index_on:
+                logger.info(
+                    "HS_CPU_PREFIX_HASH: enabled max_tokens=%s block_size=%s",
+                    self._hs_prefix_max_tokens,
+                    self._block_size,
+                )
+            else:
+                logger.info(
+                    "HS_CPU_PREFIX_HASH: disabled (engine prefix cache off)"
+                )
+"""
+    text = _replace_once(text, old_init_tail, new_init_tail, "upgrade init prefix hash")
+
+    old_save_intro = """    def save_hs_batch(
+"""
+    new_save_intro = """    def _hs_prefix_enabled(self) -> bool:
+        return bool(
+            getattr(self, "_hs_store_cpu", False)
+            and getattr(self, "_hs_prefix_index_on", False)
+            and getattr(self, "_is_tp_rank_zero", False)
+        )
+
+    def _block_extra_keys(self, req_state):
+        extra = []
+        lora = getattr(req_state, "lora_request", None)
+        if lora is not None:
+            extra.append(getattr(lora, "lora_name", None) or str(lora))
+        return tuple(extra) if extra else None
+
+    def _ensure_req_hashes(self, req_id, requests, n_blocks):
+        hashes = self._req_block_hashes.setdefault(req_id, [])
+        if n_blocks <= 0 or len(hashes) >= n_blocks:
+            return hashes[: max(n_blocks, 0)]
+        if requests is None or req_id not in requests:
+            return hashes
+        from vllm.utils.hashing import get_hash_fn_by_name
+        from vllm.v1.core import kv_cache_utils as _kvu
+        from vllm.v1.core.kv_cache_utils import hash_block_tokens, init_none_hash
+
+        st = requests[req_id]
+        ids = list(st.prompt_token_ids or [])
+        ids.extend(st.output_token_ids or [])
+        bs = int(self._block_size)
+        algo = getattr(
+            self._vllm_config.cache_config, "prefix_caching_hash_algo", "sha256"
+        )
+        hash_fn = get_hash_fn_by_name(algo)
+        if getattr(_kvu, "NONE_HASH", None) is None:
+            init_none_hash(hash_fn)
+        extra = self._block_extra_keys(st)
+        while len(hashes) < n_blocks:
+            i = len(hashes)
+            lo = i * bs
+            hi = lo + bs
+            if hi > len(ids):
+                break
+            prev = hashes[-1] if hashes else None
+            hashes.append(hash_block_tokens(hash_fn, prev, ids[lo:hi], extra))
+        return hashes
+
+    def _evict_hs_hash_blocks(self) -> None:
+        max_tok = int(getattr(self, "_hs_prefix_max_tokens", 0) or 0)
+        blocks = getattr(self, "_hs_hash_blocks", None)
+        if blocks is None or max_tok <= 0:
+            return
+        while self._hs_hash_tokens > max_tok and blocks:
+            _, old = blocks.popitem(last=False)
+            self._hs_hash_tokens -= int(old.shape[0])
+
+    def _fill_prefix_from_hash(self, req_id, page, n_prefix, requests) -> int:
+        # HS_CPU_PREFIX_HASH: copy cached full blocks into a new request page.
+        if not self._hs_prefix_enabled() or n_prefix <= 0:
+            return 0
+        bs = int(self._block_size)
+        n_blocks = n_prefix // bs
+        if n_blocks <= 0:
+            return 0
+        hashes = self._ensure_req_hashes(req_id, requests, n_blocks)
+        copied = 0
+        for i, h in enumerate(hashes[:n_blocks]):
+            blk = self._hs_hash_blocks.get(h)
+            if blk is None:
+                logger.warning(
+                    "HS_CPU_PREFIX_HASH: miss req_id=%s block=%s/%s",
+                    req_id,
+                    i,
+                    n_blocks,
+                )
+                break
+            lo = i * bs
+            hi = lo + bs
+            if page.shape[0] < hi or blk.shape[0] != bs:
+                break
+            page[lo:hi].copy_(blk)
+            self._hs_hash_blocks.move_to_end(h)
+            copied += 1
+        if copied:
+            logger.info(
+                "HS_CPU_PREFIX_HASH: filled %s/%s prefix blocks req_id=%s",
+                copied,
+                n_blocks,
+                req_id,
+            )
+        return copied * bs
+
+    def _publish_full_blocks(self, req_id, page, start, need, requests) -> None:
+        if not self._hs_prefix_enabled() or need <= start:
+            return
+        bs = int(self._block_size)
+        first = start // bs
+        last = need // bs
+        if last <= first:
+            return
+        hashes = self._ensure_req_hashes(req_id, requests, last)
+        for i in range(first, min(last, len(hashes))):
+            h = hashes[i]
+            if h in self._hs_hash_blocks:
+                self._hs_hash_blocks.move_to_end(h)
+                continue
+            lo = i * bs
+            hi = lo + bs
+            if page.shape[0] < hi:
+                break
+            self._hs_hash_blocks[h] = page[lo:hi].contiguous().clone()
+            self._hs_hash_tokens += bs
+        self._evict_hs_hash_blocks()
+
+    def save_hs_batch(
+"""
+    text = _replace_once(
+        text, old_save_intro, new_save_intro, "upgrade insert prefix helpers"
+    )
+
+    old_page_write = """            page = self._cpu_pages.get(req_id)
+            if page is None or page.shape[0] < need:
+                try:
+                    new_page = torch.empty(
+                        (cap, num_layers, hidden_size),
+                        dtype=dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                except Exception:
+                    new_page = torch.empty(
+                        (cap, num_layers, hidden_size),
+                        dtype=dtype,
+                        device="cpu",
+                    )
+                if page is not None:
+                    new_page[: page.shape[0]].copy_(page)
+                self._cpu_pages[req_id] = new_page
+                page = new_page
+            page[start:need].copy_(staging[q0:q1])
+"""
+    new_page_write = """            page = self._cpu_pages.get(req_id)
+            page_is_new = page is None
+            if page is None or page.shape[0] < need:
+                try:
+                    new_page = torch.empty(
+                        (cap, num_layers, hidden_size),
+                        dtype=dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                except Exception:
+                    new_page = torch.empty(
+                        (cap, num_layers, hidden_size),
+                        dtype=dtype,
+                        device="cpu",
+                    )
+                if page is not None:
+                    new_page[: page.shape[0]].copy_(page)
+                self._cpu_pages[req_id] = new_page
+                page = new_page
+            if page_is_new and start > 0:
+                self._fill_prefix_from_hash(req_id, page, start, requests)
+            page[start:need].copy_(staging[q0:q1])
+            self._publish_full_blocks(req_id, page, start, need, requests)
+"""
+    text = _replace_once(
+        text, old_page_write, new_page_write, "upgrade save_hs_batch prefix copy"
+    )
+
+    old_submit_pops = """        if not self._is_tp_rank_zero:
+            self._cpu_pages.pop(pending.req_id, None)
+            return
+        if getattr(self, "_hs_store_cpu", False):
+            # HS_CPU_PAGES: finish is CPU concat + save_file, no NPU gather.
+            if pending.discard:
+                self._cpu_pages.pop(pending.req_id, None)
+                return
+            page = self._cpu_pages.pop(pending.req_id, None)
+"""
+    new_submit_pops = """        if not self._is_tp_rank_zero:
+            self._cpu_pages.pop(pending.req_id, None)
+            self._req_block_hashes.pop(pending.req_id, None)
+            return
+        if getattr(self, "_hs_store_cpu", False):
+            # HS_CPU_PAGES: finish is CPU concat + save_file, no NPU gather.
+            if pending.discard:
+                self._cpu_pages.pop(pending.req_id, None)
+                self._req_block_hashes.pop(pending.req_id, None)
+                return
+            page = self._cpu_pages.pop(pending.req_id, None)
+            self._req_block_hashes.pop(pending.req_id, None)
+"""
+    return _replace_once(
+        text, old_submit_pops, new_submit_pops, "upgrade submit pop hashes"
+    )
+
+
+def upgrade_none_hash_init(text: str) -> str:
+    old = """        from vllm.utils.hashing import get_hash_fn_by_name
+        from vllm.v1.core.kv_cache_utils import hash_block_tokens
+
+        st = requests[req_id]
+        ids = list(st.prompt_token_ids or [])
+        ids.extend(st.output_token_ids or [])
+        bs = int(self._block_size)
+        algo = getattr(
+            self._vllm_config.cache_config, "prefix_caching_hash_algo", "sha256"
+        )
+        hash_fn = get_hash_fn_by_name(algo)
+        extra = self._block_extra_keys(st)
+"""
+    new = """        from vllm.utils.hashing import get_hash_fn_by_name
+        from vllm.v1.core import kv_cache_utils as _kvu
+        from vllm.v1.core.kv_cache_utils import hash_block_tokens, init_none_hash
+
+        st = requests[req_id]
+        ids = list(st.prompt_token_ids or [])
+        ids.extend(st.output_token_ids or [])
+        bs = int(self._block_size)
+        algo = getattr(
+            self._vllm_config.cache_config, "prefix_caching_hash_algo", "sha256"
+        )
+        hash_fn = get_hash_fn_by_name(algo)
+        if getattr(_kvu, "NONE_HASH", None) is None:
+            init_none_hash(hash_fn)
+        extra = self._block_extra_keys(st)
+"""
+    return _replace_once(text, old, new, "upgrade init_none_hash")
+
+
 PATCHERS = {
     "model_runner": patch_model_runner,
     "cache_only": patch_cache_only,
@@ -547,11 +971,23 @@ def main() -> int:
             failed = True
             continue
         text = path.read_text()
-        if MARKER in text:
+        if PREFIX_MARKER in text and "init_none_hash" in text:
             print(f"already patched: {path}")
             continue
         try:
-            new_text = patcher(text)
+            if (
+                key == "connector"
+                and PREFIX_MARKER in text
+                and "init_none_hash" not in text
+            ):
+                new_text = upgrade_none_hash_init(text)
+            elif key == "connector" and MARKER in text and PREFIX_MARKER not in text:
+                new_text = upgrade_connector_prefix_hash(text)
+            elif MARKER in text:
+                print(f"already patched: {path}")
+                continue
+            else:
+                new_text = patcher(text)
         except ValueError as exc:
             print(f"{key}: {exc}", file=sys.stderr)
             failed = True
