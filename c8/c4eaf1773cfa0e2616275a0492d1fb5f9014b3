@@ -1,0 +1,14 @@
+k3-hs4-runtime-patches_副本/patch_hs_cpu_pages.py
+  h_dc29e7c5e1c0e7 1-571
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c8c4eaf1773cfa0e2616275a0492d1fb5f9014b3",
+  "prompts": {},
+  "humans": {
+    "h_dc29e7c5e1c0e7": {
+      "author": "sunny-infra <sunyu_0904@163.com>"
+    }
+  }
+}
