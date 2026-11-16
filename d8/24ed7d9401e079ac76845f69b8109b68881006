@@ -1,0 +1,14 @@
+k3-hs4-runtime-patches_副本/patch_hs_cpu_pages.py
+  h_dc29e7c5e1c0e7 8-22,34-36,46-63,80-92,154-178,183-185,204-208,211-212,217,223-253,257,1039-1045,1047-1052,1054-1068,1070-1075,1077-1204,1206-3096
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d824ed7d9401e079ac76845f69b8109b68881006",
+  "prompts": {},
+  "humans": {
+    "h_dc29e7c5e1c0e7": {
+      "author": "sunny-infra <sunyu_0904@163.com>"
+    }
+  }
+}
